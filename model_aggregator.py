@@ -12,7 +12,7 @@ logging.info("--- AGGREGATOR SCRIPT INITIALIZED ---")
 class WeightAggregator:
     """
     Utility class for loading, combining, and saving model weights with partitioning.
-    Includes logic to strip common wrapper keys during loading.
+    Includes logic to strip common wrapper keys during loading and fix model prefixes.
     """
     
     def __init__(self, model_paths: List[str], weights: List[float]):
@@ -27,8 +27,8 @@ class WeightAggregator:
 
     def load_state_dicts(self) -> List[Dict[str, torch.Tensor]]:
         """
-        Loads state dictionaries directly from the file paths and attempts to 
-        extract raw weights if the checkpoint is wrapped (e.g., inside 'model_state_dict').
+        Loads state dictionaries, unloads wrappers, and ensures keys have the 
+        correct 'model.' prefix expected by WhisperForConditionalGeneration.
         """
         state_dicts = []
         
@@ -38,25 +38,28 @@ class WeightAggregator:
                 # Load the state dictionary to CPU to prevent VRAM issues during aggregation
                 state_dict = torch.load(path, map_location='cpu')
                 
-                # --- PATCH: UNWRAP COMMON CHECKPOINT STRUCTURES ---
-                # Check for known wrapper keys from various saving methods (PyTorch lightning, Hugging Face helpers)
+                # 1. UNWRAP COMMON CHECKPOINT STRUCTURES
                 if 'model_state_dict' in state_dict:
-                    logging.info(f"Unwrapping Model {i+1}: Found and extracted 'model_state_dict' key.")
+                    logging.warning(f"Model {i+1}: Found and extracted 'model_state_dict' wrapper.")
                     state_dict = state_dict['model_state_dict']
+                elif 'state_dict' in state_dict:
+                    logging.warning(f"Model {i+1}: Found and extracted 'state_dict' wrapper.")
+                    state_dict = state_dict['state_dict']
                 
-                # Check for PyTorch Lightning/Finetuning structure
-                # The original whisper model structure is typically flat (e.g., model.encoder.conv1.weight)
-                if not any(k.startswith('model.') for k in state_dict.keys()):
-                    logging.warning(f"Model {i+1} structure is flat. Attempting to add 'model.' prefix if necessary.")
+                # 2. FIX KEY PREFIX (CRITICAL FIX FOR EVALUATE.PY)
+                # If the first key does not start with 'model.', we assume the HuggingFace prefix is missing.
+                first_key = next(iter(state_dict.keys()), None)
+                if first_key and not first_key.startswith('model.'):
+                    logging.info(f"Model {i+1}: Fixing missing 'model.' prefix in keys.")
                     
-                    # If the keys look like encoder.conv1.weight, add 'model.' prefix
-                    # NOTE: This part is highly dependent on how the checkpoint was saved.
                     new_state_dict = {}
                     for key, tensor in state_dict.items():
-                        new_state_dict['model.' + key] = tensor
+                        # Exclude non-tensor keys (like 'dims', 'optimizer') if they somehow remain
+                        if isinstance(tensor, torch.Tensor):
+                            new_state_dict['model.' + key] = tensor
                     state_dict = new_state_dict
-
-                # Remove non-weight metadata keys if they somehow survived the unwrapping
+                
+                # 3. Final Metadata Cleanup (optional keys)
                 if 'dims' in state_dict:
                     del state_dict['dims']
                     
@@ -65,7 +68,6 @@ class WeightAggregator:
             
             except Exception as e:
                 logging.critical(f"CRITICAL LOAD FAILURE for {path}: {e}")
-                # Crash hard if a core model cannot be loaded/unwrapped
                 raise RuntimeError(f"Model loading failed for {path}") from e
 
         if len(state_dicts) != len(self.model_paths):
@@ -74,8 +76,6 @@ class WeightAggregator:
 
     def combine_weights(self, state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Combines the loaded state dictionaries using the configured weights and recursion."""
-        
-        # NOTE: This uses the recursive helper function defined below (assuming it is run or defined here)
         
         if not state_dicts:
             raise ValueError("Cannot combine weights: no state dictionaries were loaded.")
