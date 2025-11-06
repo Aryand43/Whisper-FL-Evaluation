@@ -1,3 +1,12 @@
+import sys
+# --- PATCH START: BLOCK TORCHVISION TO PREVENT SEGMENTATION FAULT ---
+# The transformers library unnecessarily imports torchvision (a vision library) 
+# during module loading, which triggers a fatal C++/CUDA memory crash (Segmentation Fault).
+try:
+    if 'torchvision' in sys.modules:
+        del sys.modules['torchvision']
+except Exception:
+    pass # Safely ignore if the module cannot be deleted
 import torch
 import argparse
 import os
