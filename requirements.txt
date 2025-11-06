@@ -1,2 +1,6 @@
 torch
 tqdm
+evaluate
+wandb
+datasets
+transformers
