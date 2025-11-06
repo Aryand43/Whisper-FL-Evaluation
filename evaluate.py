@@ -32,25 +32,15 @@ class EvaluationManager:
         self.processor = None
         self.model = None
 
-        try:
-            logging.info("--- 2.1. SANITY CHECK: Initializing WER Metric ---") # Sanity Check 2.1
-            self.wer_metric = evaluate.load("wer")
-            logging.info("--- 2.2. SANITY CHECK: Initializing BLEU Metric ---") # Sanity Check 2.2
-            self.bleu_metric = evaluate.load("bleu")
-        except Exception as e:
-            logging.critical(f"CRITICAL INIT FAILURE: Could not load Hugging Face 'evaluate' metrics: {e}")
-            raise # Re-raise to crash hard and expose the error
-
-        logging.info("--- 2. FINISHED EvaluationManager __init__ ---") # Sanity Check 2
-        # ... rest of the methods remain unchanged for now ...
+        # IMPORTANT: Metrics loading is MOVED to _calculate_and_log_metrics 
+        # to prevent std::bad_alloc during initialization
+        self.wer_metric = None
+        self.bleu_metric = None 
         
+        logging.info("--- 2. FINISHED EvaluationManager __init__ (Metrics deferred) ---") # Sanity Check 2
+
     def _login_to_wandb(self):
-        # ... (login logic) ...
-        # [No changes needed in _login_to_wandb for pinpointing the silent crash]
-        
-        # Original logic remains here
-
-        # ...
+        """Prompts the user for W&B API key and initializes the run."""
         if 'WANDB_API_KEY' not in os.environ:
             logging.warning("WANDB_API_KEY not found. Prompting user for key.")
             try:
@@ -73,14 +63,16 @@ class EvaluationManager:
             return False
 
     def _normalize_text(self, text: str) -> str:
+        """Applies basic text normalization (lowercase, punctuation removal for German ASR)."""
         text = text.lower()
         text = re.sub(r"[^\w\säöüß]", "", text)  
         text = re.sub(r"\s\s+", " ", text).strip()
         return text
 
     def _load_and_prepare_data(self):
-        logging.info("--- 3. STARTING Data Preparation ---") # Sanity Check 3
+        logging.info("--- 3. STARTING Data Preparation (i4ds/spc_r) ---") # Sanity Check 3
         try:
+            # Load the specific 'test' split (679 rows)
             raw_datasets = load_dataset(self.dataset_name, split="test")  
             raw_datasets = raw_datasets.cast_column("audio", Audio(sampling_rate=16000))
 
@@ -99,7 +91,7 @@ class EvaluationManager:
             return processed_datasets
             
         except Exception as e:
-            logging.critical(f"CRITICAL DATASET FAILURE: Check dataset name, columns, and audio dependencies (ffmpeg, torchcodec): {e}")
+            logging.critical(f"CRITICAL DATASET FAILURE: Check dataset name, columns, and audio dependencies: {e}")
             raise # Crash hard
 
     def _load_model_and_processor(self):
@@ -122,16 +114,28 @@ class EvaluationManager:
             raise # Crash hard
 
     def _calculate_and_log_metrics(self, predictions: List[str], references: List[str]):
-        # ... (metric calculation logic) ...
-        # [No changes needed here as the crash happens before inference]
+        # --- 6. STARTING Metric Initialization (Deferred) ---
+        logging.info("--- 6. STARTING Metric Initialization (Deferred) ---")
+        try:
+            self.wer_metric = evaluate.load("wer")
+            self.bleu_metric = evaluate.load("bleu")
+        except Exception as e:
+            logging.critical(f"CRITICAL METRIC LOAD FAILURE: Could not load Hugging Face 'evaluate' metrics: {e}")
+            raise
+            
         logging.info("Calculating corpus-level metrics...")
         
+        # --- WER (Word Error Rate) ---
         wer_score = self.wer_metric.compute(predictions=predictions, references=references) * 100
+        
+        # --- BLEU Score (requires list of list of references) ---
         bleu_references = [[r] for r in references]
         bleu_results = self.bleu_metric.compute(predictions=predictions, references=bleu_references)
         
         logging.info(f"Corpus Word Error Rate (WER): {wer_score:.2f}%")
+        logging.info(f"Corpus BLEU Score: {bleu_results['bleu']:.2f}")
 
+        # W&B Logging
         if wandb.run:
             wandb.log({
                 "corpus_wer": wer_score,
@@ -141,24 +145,22 @@ class EvaluationManager:
             logging.info("Metrics successfully logged to W&B.")
 
     def run_pipeline(self):
-        # 5. STARTING PIPELINE
+        logging.info("--- 5. STARTING run_pipeline EXECUTION ---")
+        if not self._login_to_wandb():
+            return
+
         try:
-            if not self._login_to_wandb():
-                return
-            
-            # 5.1 Call the loaded methods
             if not self._load_model_and_processor():
                 return
 
             processed_datasets = self._load_and_prepare_data()
             if processed_datasets is None:
                 return
-            
-            # ... (inference loop and final log) ...
-            # [The inference loop will crash on its own if necessary, we focus on setup]
-            
+
+            # --- Inference Loop Setup ---
             predictions = []
             references = []
+            logging.info("--- 7. STARTING Inference ---")
             
             # Data collator definition remains here...
             def data_collator(features):
@@ -178,6 +180,7 @@ class EvaluationManager:
                 collate_fn=data_collator
             )
 
+            # --- Inference Execution ---
             with torch.no_grad():
                 for batch in tqdm(data_loader, desc="Transcribing Test Set"):
                     input_features = batch["input_features"].to(self.device)
@@ -194,7 +197,6 @@ class EvaluationManager:
 
             self._calculate_and_log_metrics(predictions, references)
 
-
         except RuntimeError as e:
             logging.critical(f"RUNTIME ERROR during pipeline: {e}")
         except Exception as e:
@@ -205,8 +207,7 @@ class EvaluationManager:
 
 def main():
     """Main function to parse arguments and execute the evaluation pipeline."""
-    # 6. ARGS PARSE CHECK
-    logging.info("--- 6. STARTING Args and Main Execution ---")
+    logging.info("--- 8. STARTING Args and Main Execution ---")
 
     parser = argparse.ArgumentParser(
         description="Evaluate an aggregated Whisper checkpoint and log metrics to W&B."
@@ -241,8 +242,8 @@ def main():
     # Determine device dynamically
     execution_device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 7. MANAGER INSTANTIATION CHECK
-    logging.info("--- 7. INSTANTIATING EvaluationManager ---")
+    # 9. MANAGER INSTANTIATION CHECK
+    logging.info("--- 9. INSTANTIATING EvaluationManager ---")
 
     manager = EvaluationManager(
         model_path=args.model_checkpoint,
@@ -252,8 +253,8 @@ def main():
         device=execution_device
     )
     
-    # 8. PIPELINE EXECUTION CHECK
-    logging.info("--- 8. EXECUTING run_pipeline ---")
+    # 10. PIPELINE EXECUTION CHECK
+    logging.info("--- 10. EXECUTING run_pipeline ---")
     manager.run_pipeline()
 
 
