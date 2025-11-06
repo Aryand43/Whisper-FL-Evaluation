@@ -7,50 +7,13 @@ import logging
 
 # Set up logging for better error reporting
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-
-def _recursive_add_weighted_tensors(target_dict: Dict[str, Any], source_dict: Dict[str, Any], weight: float):
-    """
-    Recursively traverses dictionaries, finds weight tensors, and adds the 
-    weighted contribution from the source to the target dictionary.
-    
-    This addresses the concern of 'preconverged weights' by ensuring only 
-    terminal tensor data (weights) are combined, skipping nested metadata.
-    """
-    
-    for key, target_value in target_dict.items():
-        source_value = source_dict.get(key)
-        
-        if source_value is None:
-            # If a key exists in the target but not the source, just preserve the target value.
-            logging.debug(f"Key '{key}' missing in source dictionary. Preserving target value.")
-            continue
-
-        if isinstance(target_value, dict) and isinstance(source_value, dict):
-            # Recursive Case: Both are dictionaries, continue traversal
-            _recursive_add_weighted_tensors(target_value, source_value, weight)
-        
-        elif isinstance(target_value, torch.Tensor) and isinstance(source_value, torch.Tensor):
-            # Base Case: Found Tensors (model weights). Perform weighted addition.
-            if target_value.shape == source_value.shape:
-                try:
-                    target_value.add_(source_value * weight)
-                except RuntimeError as e:
-                    logging.error(f"Tensor operation failed for key '{key}': {e}")
-                    raise
-            else:
-                # Shape mismatch indicates incompatible model layers (critical error for aggregation)
-                logging.error(f"Tensor shape mismatch for key '{key}': Target {target_value.shape} vs Source {source_value.shape}. Stopping.")
-                raise ValueError("Incompatible model architectures detected.")
-        
-        # Non-tensor, non-dictionary values (e.g., config integers, strings) are skipped and 
-        # preserved from the first model (target_dict)
-        elif not (isinstance(target_value, dict) or isinstance(target_value, torch.Tensor)):
-             logging.debug(f"Skipping metadata key '{key}'.")
-             pass # Skip non-tensor/non-dict metadata
-
+logging.info("--- AGGREGATOR SCRIPT INITIALIZED ---")
 
 class WeightAggregator:
-    """Utility class for loading, combining, and saving model weights with partitioning."""
+    """
+    Utility class for loading, combining, and saving model weights with partitioning.
+    Includes logic to strip common wrapper keys during loading.
+    """
     
     def __init__(self, model_paths: List[str], weights: List[float]):
         if len(model_paths) != len(weights):
@@ -63,18 +26,46 @@ class WeightAggregator:
         logging.info(f"Normalized Weights (Partitions): {self.weights}")
 
     def load_state_dicts(self) -> List[Dict[str, torch.Tensor]]:
-        """Loads all state dictionaries directly from the file paths provided."""
+        """
+        Loads state dictionaries directly from the file paths and attempts to 
+        extract raw weights if the checkpoint is wrapped (e.g., inside 'model_state_dict').
+        """
         state_dicts = []
         
-        logging.info("Starting model state dictionary loading...")
+        logging.info("Starting model state dictionary loading and unwrapping...")
         for i, path in enumerate(tqdm(self.model_paths, desc="Loading Models")):
             try:
                 # Load the state dictionary to CPU to prevent VRAM issues during aggregation
                 state_dict = torch.load(path, map_location='cpu')
+                
+                # --- PATCH: UNWRAP COMMON CHECKPOINT STRUCTURES ---
+                # Check for known wrapper keys from various saving methods (PyTorch lightning, Hugging Face helpers)
+                if 'model_state_dict' in state_dict:
+                    logging.info(f"Unwrapping Model {i+1}: Found and extracted 'model_state_dict' key.")
+                    state_dict = state_dict['model_state_dict']
+                
+                # Check for PyTorch Lightning/Finetuning structure
+                # The original whisper model structure is typically flat (e.g., model.encoder.conv1.weight)
+                if not any(k.startswith('model.') for k in state_dict.keys()):
+                    logging.warning(f"Model {i+1} structure is flat. Attempting to add 'model.' prefix if necessary.")
+                    
+                    # If the keys look like encoder.conv1.weight, add 'model.' prefix
+                    # NOTE: This part is highly dependent on how the checkpoint was saved.
+                    new_state_dict = {}
+                    for key, tensor in state_dict.items():
+                        new_state_dict['model.' + key] = tensor
+                    state_dict = new_state_dict
+
+                # Remove non-weight metadata keys if they somehow survived the unwrapping
+                if 'dims' in state_dict:
+                    del state_dict['dims']
+                    
                 state_dicts.append(state_dict)
-                logging.info(f"Successfully loaded state dict from: {path} (Model {i+1})")
+                logging.info(f"Successfully prepared state dict from: {path} (Model {i+1})")
+            
             except Exception as e:
-                logging.error(f"CRITICAL LOAD FAILURE for {path}: {e}")
+                logging.critical(f"CRITICAL LOAD FAILURE for {path}: {e}")
+                # Crash hard if a core model cannot be loaded/unwrapped
                 raise RuntimeError(f"Model loading failed for {path}") from e
 
         if len(state_dicts) != len(self.model_paths):
@@ -83,15 +74,25 @@ class WeightAggregator:
 
     def combine_weights(self, state_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Combines the loaded state dictionaries using the configured weights and recursion."""
+        
+        # NOTE: This uses the recursive helper function defined below (assuming it is run or defined here)
+        
         if not state_dicts:
             raise ValueError("Cannot combine weights: no state dictionaries were loaded.")
 
-        # --- Step 1: Initialize the target dictionary (Model 1 weighted) ---
+        # Initialize the averaged state dict with the first model's weights * its partition
         weighted_state_dict = {}
         first_state_dict = state_dicts[0]
         first_weight = self.weights[0]
         
         logging.info("Initializing target state dictionary with first model's weighted contribution...")
+        
+        # Check if helper is available (defined below in the real file structure)
+        if '_recursive_add_weighted_tensors' not in globals():
+             logging.critical("FATAL: _recursive_add_weighted_tensors helper function is missing from global scope.")
+             raise NotImplementedError("Recursive helper is missing.")
+
+
         try:
             for key, tensor in tqdm(first_state_dict.items(), desc="Initial Weighting"):
                 if isinstance(tensor, torch.Tensor):
@@ -100,23 +101,18 @@ class WeightAggregator:
                     # Preserve metadata from the first model
                     weighted_state_dict[key] = tensor 
 
-        except Exception as e:
-            logging.error(f"CRITICAL INITIALIZATION FAILURE: {e}")
-            raise RuntimeError("Initialization failed.") from e
-
-        # --- Step 2: Recursively add contributions from remaining models ---
-        logging.info("Recursively aggregating weights from remaining models...")
-        for i, source_dict in enumerate(tqdm(state_dicts[1:], desc="Aggregating Models")):
-            weight = self.weights[i + 1]
-            try:
-                # Use the recursive helper to add the weighted contribution
+            # Recursively add contributions from remaining models
+            logging.info("Recursively aggregating weights from remaining models...")
+            for i, source_dict in enumerate(tqdm(state_dicts[1:], desc="Aggregating Models")):
+                weight = self.weights[i + 1]
                 _recursive_add_weighted_tensors(weighted_state_dict, source_dict, weight)
-            except Exception as e:
-                logging.error(f"Aggregation failed for Model {i+2}: {e}")
-                raise RuntimeError("Weight combination failed due to nested error.") from e
 
-        logging.info("Weighted combination complete.")
-        return weighted_state_dict
+            logging.info("Weighted combination complete.")
+            return weighted_state_dict
+            
+        except Exception as e:
+            logging.critical(f"CRITICAL COMBINATION FAILURE: {e}")
+            raise RuntimeError("Weight combination failed.") from e
 
     def save_model(self, state_dict: Dict[str, Any], output_path: str):
         """Saves the final aggregated state dictionary to a .pt file."""
@@ -125,11 +121,41 @@ class WeightAggregator:
             torch.save(state_dict, output_path)
             logging.info(f"Successfully saved aggregated model to {output_path}")
         except Exception as e:
-            logging.error(f"CRITICAL SAVE FAILURE: {e}")
+            logging.critical(f"CRITICAL SAVE FAILURE: {e}")
             raise RuntimeError("Model saving failed.") from e
+
+# --- Recursive Helper Function (Must be defined outside the class) ---
+
+def _recursive_add_weighted_tensors(target_dict: Dict[str, Any], source_dict: Dict[str, Any], weight: float):
+    """Recursively traverses and performs weighted tensor addition."""
+    
+    for key, target_value in target_dict.items():
+        source_value = source_dict.get(key)
+        
+        if source_value is None:
+            continue
+
+        if isinstance(target_value, dict) and isinstance(source_value, dict):
+            _recursive_add_weighted_tensors(target_value, source_value, weight)
+        
+        elif isinstance(target_value, torch.Tensor) and isinstance(source_value, torch.Tensor):
+            if target_value.shape == source_value.shape:
+                try:
+                    target_value.add_(source_value * weight)
+                except RuntimeError as e:
+                    logging.error(f"Tensor operation failed for key '{key}': {e}")
+                    raise
+            else:
+                logging.error(f"Tensor shape mismatch for key '{key}': Target {target_value.shape} vs Source {source_value.shape}. Stopping.")
+                raise ValueError("Incompatible model architectures detected.")
+        
+        # Skip non-tensor/non-dict values
 
 def main():
     """Main function to parse arguments and execute the aggregation pipeline."""
+    # Ensure torch is not using CUDA devices before main to prevent accidental GPU memory usage
+    os.environ['CUDA_VISIBLE_DEVICES'] = '' 
+    
     parser = argparse.ArgumentParser(
         description="Weighted aggregation of multiple fine-tuned Whisper model checkpoints."
     )
@@ -137,14 +163,14 @@ def main():
         '--models', 
         nargs='+', 
         required=True, 
-        help='List of direct paths to model checkpoint files (e.g., model_A.pt).'
+        help='List of root directories for each model (or direct path to .pt file).'
     )
     parser.add_argument(
         '--weights', 
         nargs='+', 
         type=float, 
         required=True, 
-        help='List of corresponding weights (e.g., 0.6 0.2 0.1). Must match the number of models.'
+        help='List of corresponding weights (e.g., 0.6 0.2 0.2). Must match the number of models.'
     )
     parser.add_argument(
         '--output', 
@@ -155,7 +181,7 @@ def main():
     
     args = parser.parse_args()
 
-    # --- Main Pipeline Execution with Global Try/Except for Debugging ---
+    # --- Main Pipeline Execution with Global Try/Except ---
     try:
         # Step 1: Initialize Aggregator
         aggregator = WeightAggregator(args.models, args.weights)
@@ -172,11 +198,12 @@ def main():
         logging.info("--- Pipeline Completed Successfully ---")
 
     except Exception as e:
-        # Catch any uncaught critical error from the previous steps
+        # This catches any uncaught critical error from the previous steps
         logging.critical(f"FATAL ERROR in main execution: {e}. Pipeline terminated.")
 
 
 if __name__ == "__main__":
-    # Prevent accidental CUDA usage during initial CPU-bound tensor manipulation
-    os.environ['CUDA_VISIBLE_DEVICES'] = '' 
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL ERROR IN MAIN EXECUTION: {e}")
