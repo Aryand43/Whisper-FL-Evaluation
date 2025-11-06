@@ -32,8 +32,7 @@ class EvaluationManager:
         self.processor = None
         self.model = None
 
-        # IMPORTANT: Metrics loading is MOVED to _calculate_and_log_metrics 
-        # to prevent std::bad_alloc during initialization
+        # Deferred metric loading (Crucial memory fix for std::bad_alloc)
         self.wer_metric = None
         self.bleu_metric = None 
         
@@ -196,6 +195,7 @@ class EvaluationManager:
                         references.append(self._normalize_text(ref))
 
             self._calculate_and_log_metrics(predictions, references)
+
 
         except RuntimeError as e:
             logging.critical(f"RUNTIME ERROR during pipeline: {e}")
